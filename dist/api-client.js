@@ -3,7 +3,7 @@
  * (c) 2018-2020 Martin Rafael Gonzalez <tin@devtin.io>
  * Released under the MIT License.
  */
-var PleasureApiClient = (function (exports, axios, objectHash, io) {
+var ApiClient = (function (exports, axios, objectHash, io) {
   'use strict';
 
   axios = axios && axios.hasOwnProperty('default') ? axios['default'] : axios;
