@@ -1,18 +1,16 @@
 import { ApiError } from './api-error'
-import { getConfig } from './get-config.js'
 import axios from 'axios'
 import qs from 'qs'
+import { debug } from './debug.js'
 import get from 'lodash/get'
-
-export let config = getConfig()
 
 /**
  * Creates an axios instance able to handle API responses
  * @param {String} apiURL - URL of the API
- * @param {Number} timeout - Timeout in milliseconds
+ * @param {Number} [timeout] - Timeout in milliseconds
  * @return {Object} - axios instance
  */
-export function getDriver ({ apiURL = config.apiURL, timeout = config.timeout } = {}) {
+export function getDriver ({ apiURL, timeout = 3000 }) {
   const driver = axios.create({
     timeout,
     baseURL: apiURL,
@@ -20,32 +18,33 @@ export function getDriver ({ apiURL = config.apiURL, timeout = config.timeout } 
       return qs.stringify(params, { arrayFormat: 'brackets' })
     },
     headers: {
-      'X-Pleasure-Client': VERSION
+      'X-Pleasure-Client': process.env.VERSION || 'edge'
     }
   })
 
-  driver.interceptors.response.use((response) => {
-      const { data: { statusCode, data, error, message } } = response || {}
+  driver.interceptors.request.use((req) => {
+      debug() && console.log(`api-client request`, req)
+      return req
+    }
+  )
 
-      if (statusCode === 200) {
+  driver.interceptors.response.use((response) => {
+      // console.log({ response })
+      const { data: { code = 500, data, error = { message: 'Unknown error', errors: [] } } } = response || {}
+
+      if (code === 200) {
         return data
       }
 
-      throw new ApiError(error, message, statusCode, data)
-    },
+      console.log(error.errors)
+
+      throw new ApiError(error.message, code, error.errors)
+    }/*,
     err => {
-      const { errors, error } = get(err, 'response.data', {})
-
-      if (process.env.API_ERROR) {
-        if (err && err.response) {
-          console.log(`[api:${ err.config.method }(${ err.response.status }/${ err.response.statusText }) => ${ err.config.url }] ${ JSON.stringify(err.response.data) }`)
-        } else {
-          console.log(`[api:`, err)
-        }
-      }
-
-      throw new Error(error || 'Unknown error')
-    })
+      console.log(`api error trapped`, err)
+      throw err
+    }*/
+  )
 
   return driver
 }
@@ -54,4 +53,3 @@ export function getDriver ({ apiURL = config.apiURL, timeout = config.timeout } 
  * Instance of getDriver using default values.
  * @type getDriver
  */
-export default getDriver()

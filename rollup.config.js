@@ -6,9 +6,9 @@ const json = require('rollup-plugin-json')
 const rollupBuiltins = require('rollup-plugin-node-builtins')
 const rollupReplace = require('rollup-plugin-replace')
 const merge = require('deepmerge')
-const { getConfig: getApiConfig, getPlugins: getApiPlugins } = require('@pleasure-js/api')
-const { port, entitiesUri, prefix } = getApiConfig()
-const { pluginsConfig: { jwt: { authEndpoint, revokeEndpoint } } } = getApiPlugins()
+const { getConfig: getApiConfig, getPlugins: getApiPlugins } = require('@pleasure-js/utils-v2')
+const { config: { http: { port }, entities: { prefix: entitiesUri }, api: { prefix } } } = getApiConfig()
+// const { pluginsConfig: { jwt: { authEndpoint, revokeEndpoint } } } = getApiPlugins()
 const fs = require('fs')
 const path = require('path')
 
@@ -24,8 +24,8 @@ const getPlugins = ({ minified = false, bundle = false, replace = {} } = {}) => 
       VERSION: JSON.stringify(version),
       DEF_API_PORT: JSON.stringify(port),
       DEF_API_PREFIX: JSON.stringify(prefix),
-      DEF_API_AUTH_ENDPOINT: JSON.stringify(authEndpoint),
-      DEF_API_REVOKE_ENDPOINT: JSON.stringify(revokeEndpoint),
+      // DEF_API_AUTH_ENDPOINT: JSON.stringify(authEndpoint),
+      // DEF_API_REVOKE_ENDPOINT: JSON.stringify(revokeEndpoint),
       DEF_API_ENTITIES_URI: JSON.stringify(entitiesUri)
     }, replace)),
     json()
@@ -54,7 +54,7 @@ const getPlugins = ({ minified = false, bundle = false, replace = {} } = {}) => 
         jsnext: true,
         main: true,
         browser: true,
-        only: ['lodash', 'qs', 'jwt-decode', 'deepmerge', 'url']
+        only: ['lodash', 'qs', 'jwt-decode', 'deepmerge', 'url', 'object-hash']
       }),
       commonjs()
     )
@@ -70,13 +70,11 @@ const getPlugins = ({ minified = false, bundle = false, replace = {} } = {}) => 
   return plugs
 }
 
-const plugins = getPlugins()
-const name = 'ApiClient'
-
 const envReplace = {
   'process.env.API_ERROR': JSON.stringify(false),
   'process.server': false,
   'process.client': true,
+  'process.env.VERSION': JSON.stringify(version),
   'process.env.PLEASURE_CLIENT_APP_URL': null,
   'process.env.PLEASURE_CLIENT_APP_SERVER_URL': null,
   'process.env.PLEASURE_MODE': null,
@@ -85,6 +83,9 @@ const envReplace = {
   'process.env.PLEASURE_CLIENT_AUTH_ENDPOINT': null,
   'process.env.PLEASURE_CLIENT_REVOKE_ENDPOINT': null
 }
+
+const plugins = getPlugins({ replace: envReplace })
+const name = 'ApiClient'
 
 module.exports = [
   {

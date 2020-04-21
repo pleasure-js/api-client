@@ -1,218 +1,28 @@
-import apiDriver, { getDriver, config } from './lib/driver.js'
+import { getDriver } from './lib/driver.js'
 import { ApiError } from './lib/api-error'
 import castArray from 'lodash/castArray'
-import kebabCase from 'lodash/kebabCase'
-import forEach from 'lodash/forEach'
-import mapValues from 'lodash/mapValues'
 import objectHash from 'object-hash'
 import jwtDecode from 'jwt-decode'
-import { EventEmitter } from 'events'
-import { getConfig } from './lib/get-config.js'
-import merge from 'deepmerge'
-import io from 'socket.io-client'
-import url from 'url'
+import { ApiProxy } from './api-proxy.js'
+import { ReduxClient } from './lib/redux-client.js'
+import { queryParamEncode } from './lib/query-param-encoder.js'
+import { debug } from './lib/debug.js'
 
 Promise.each = async function (arr, fn) { // take an array and a function
   for (const item of arr) await fn(item)
 }
 
-let _config = getConfig()
-
 let singleton
 
-export let debug = false
-
-export const defaultReduxOptions = {
-  autoConnect: !!process.client
-}
-
-class ReduxClient extends EventEmitter {
-  /**
-   *
-   * @param {String} apiURL - URL to the API server
-   * @param {Object} options
-   * @param {Boolean} [options.autoConnect=true] - Whether to auto-connect to socket.io at init or not.
-   */
-  constructor (apiURL, options = {}) {
-    super()
-    options = merge.all([options, defaultReduxOptions, options])
-    const { protocol, host, pathname } = url.parse(apiURL)
-    this._options = options
-    this._token = null
-    this._isConnected = false
-    this._isConnecting = false
-    this._connectedAuth = null
-    this._host = `${ protocol }//${ host }`
-    this._path = `${ pathname }-socket`
-    this._socketId = null
-
-    this._socket = null
-
-    this._binds = {
-      error: this._error.bind(this),
-      connect: this._connect.bind(this),
-      disconnect: this._disconnect.bind(this),
-      create: this._proxySocket.bind(this, 'create'),
-      update: this._proxySocket.bind(this, 'update'),
-      delete: this._proxySocket.bind(this, 'delete'),
-      '*': (event, payload) => {
-        debug && console.log(`emit all`, { event, payload })
-        this.emit('*', event, payload)
-      }
-    }
-
-    if (this._options.autoConnect) {
-      this.connect()
-    }
-  }
-
-  connect () {
-    if (this._connectedAuth === this.token && (this._isConnected || this._isConnecting)) {
-      return
-    }
-
-    this._isConnecting = true
-    this._isConnected = false
-    this._connectedAuth = this.token
-
-    const auth = Object.assign({ forceNew: true, path: this._path }, this.token ? {
-      transportOptions: {
-        polling: {
-          extraHeaders: {
-            Authorization: `Bearer ${ this.token }`
-          }
-        }
-      }
-    } : {})
-
-    if (this._socket) {
-      debug && this._socketId && console.log(`disconnecting from ${ this._socketId }`)
-      this._unwireSocket()
-      this._socket.disconnect(true)
-    }
-
-    debug && console.log(`connecting ${ this.token ? 'with' : 'without' } credentials`)
-    const theSocket = io(this._host, auth)
-
-    if (debug) {
-      theSocket.on('connect', () => {
-        if (this._socket === theSocket) {
-          this._socketId = theSocket.id
-          debug && console.log(`@pleasure-js/api-client connected with id ${ theSocket.id }`)
-        } else {
-          debug && console.log(`BEWARE! @pleasure-js/api-client connected with id ${ theSocket.id } but not the main driver`)
-        }
-      })
-
-      theSocket.on('disconnect', (reason) => {
-        debug && console.log(`@pleasure-js/api-client disconnected due to ${ reason }`)
-      })
-
-      theSocket.on('reconnecting', (attemptNumber) => {
-        debug && console.log(`@pleasure-js/api-client reconnecting attempt # ${ attemptNumber }`)
-      })
-    }
-
-    theSocket.onevent = ReduxClient._onEvent(theSocket.onevent)
-
-    this._socket = theSocket
-    this._wireSocket()
-  }
-
-  static _onEvent (event) {
-    return function (packet) {
-      debug && console.log(`receiving packet ${ packet }`)
-      const args = packet.data || []
-      event.call(this, packet)
-      packet.data = ['*'].concat(args)
-      event.call(this, packet)
-    }
-  }
-
-  /**
-   * Deeply scans and encodes complex objects to be sent via query params to the controller.
-   *
-   * - Converts regex values into { $regex, $options } for mongoDB purposes
-   *
-   * @param {Object} obj - The object to encode
-   * @return {Object} - Encoded object
-   *
-   * @example
-   *
-   * console.log(PleasureClient.queryParamEncode({ email: /@gmail.com$/i }))
-   * // { email: { $regex: '@gmail.com', $options: 'i' } }
-   */
-  static queryParamEncode (obj) {
-    return mapValues(obj, o => {
-      if (Array.isArray(o)) {
-        return o
-      }
-
-      if (o instanceof RegExp) {
-        return { $regex: o.source, $options: o.flags }
-      }
-
-      if (typeof o === 'object') {
-        return ApiClient.queryParamEncode(o)
-      }
-
-      // temporary fix for listing with double quotes
-      return JSON.stringify(o)
-    })
-  }
-
-  _wiring (methods, on = true, altMethod) {
-    methods.forEach(method => {
-      this._socket[on ? 'on' : 'off'](method, altMethod || this._binds[method])
-    })
-  }
-
-  _unwireSocket () {
-    this._wiring(Object.keys(this._binds), false)
-    this._socket.removeAllListeners()
-  }
-
-  _wireSocket () {
-    this._wiring(Object.keys(this._binds))
-  }
-
-  _proxySocket (method, payload) {
-    debug && console.log(`proxy socket`, { method, payload })
-    this.emit(method, payload)
-  }
-
-  _error (...args) {
-    this._isConnecting = false
-    this.emit('error', ...args)
-  }
-
-  _connect () {
-    debug && console.log(`connected ${ this._socket.id }`)
-    this._isConnected = true
-    this._isConnecting = false
-    this.emit('connect')
-  }
-
-  _disconnect (err) {
-    debug && console.log(`disconnected ${ this._socket.id }`)
-    this._isConnected = false
-    this.emit('disconnect')
-  }
-
-  get socket () {
-    return this._socket
-  }
-
-  get token () {
-    return this._token
-  }
-
-  set token (v) {
-    this._token = v
-    this.connect()
-    return v
-  }
-}
+/**
+ * @typedef {Object} ApiClientConfig
+ * @property {Object} api - PleasureApi related configuration.
+ * @property {String} [apiURL=http://localhost:3000/api] - URL to the API server
+ * @property {String} [entitiesUri=/entities] - endpoint where to access the entities schema.
+ * @property {String} [authEndpoint=/token] - endpoint where to exchange credentials for accessToken / refreshToken.
+ * @property {String} [revokeEndpoint=/revoke] - endpoint where to exchange credentials for accessToken / refreshToken.
+ * @property {Number} [timeout=15000] - axios timeout in ms.
+ */
 
 /**
  * Client for querying the API server.
@@ -240,153 +50,96 @@ export class ApiClient extends ReduxClient {
    * Initializes a client driver for the API server.
    * @constructor
    *
-   * @param {Object} options - Options
+   * @param {Object} [options] - Options
+   * @param {String} [options.name] - Client name
    * @param {Object} [options.driver] - Driver to issue ajax requests to the API server. Defaults to {@link getDriver}.
-   * @param {ApiClientConfig} [options.config] - Optional object to override local configuration. See {@link ClientConfig}.
+   * @param {ApiClientConfig} options.config - Optional object to override local configuration. See {@link ClientConfig}.
    * @param {String} [options.accessToken] - Optional accessToken in case to start the driver with a session.
    * @param {String} [options.refreshToken] - Optional refreshToken in case to start the driver with a session.
    * @param {Object} [options.reduxOptions] - Redux options. See {@link ReduxClient}.
+   * @param {Boolean} [options.storeCredentials] - Whether to autoSave credentials (accessToken, refreshToken)
+   * @param {Boolean} [options.credentialsStorage='localStorage'] - Whether `localStorage` or `sessionStorage`
+   * @param {Boolean} [options.credentialsStorageName='pleasure-credentials'] - Whether to autoSave credentials (accessToken, refreshToken)
    */
-  constructor (options) {
-    const { accessToken, refreshToken, driver = getDriver(), config = _config, reduxOptions = {} } = options || {}
-    debug && console.log(`initializing @pleasure-js/api-client`, { reduxOptions })
+  constructor (options = {}) {
+    const { apiURL, timeout } = options.config
+    const {
+      driver = getDriver({
+        apiURL,
+        timeout
+      }),
+      config,
+      reduxOptions = {},
+      storeCredentials = true,
+      credentialsStorage = 'localStorage',
+      credentialsStorageName = 'pleasure-credentials',
+      autoLoadCredentials = true
+    } = options
+
+    debug() && console.log(`initializing @pleasure-js/api-client`, { reduxOptions })
     const { baseURL } = driver.defaults
     super(baseURL, reduxOptions)
 
+    const { accessToken, refreshToken } = Object.assign(this.savedCredentials(), options)
+
+    this._autoLoadCredentials = autoLoadCredentials
+    this._options = options
+    this._name = options.name
     this._driver = driver
     this._userProfile = null
     this._daemonSessionExpired = null
     this._cache = []
     this.config = config
+    this._storeCredentials = storeCredentials
+    this._credentialsStorage = credentialsStorage
+    this._credentialsStorageName = credentialsStorageName
 
     this.setCredentials({ accessToken, refreshToken })
 
-    /**
-     * Creates a manager for delegating magic access to entries or entities
-     *
-     * @param {Function} Binder - Function to be called
-     * @return {Function} - The binder manager
-     */
-    const DelegatorManager = (Binder) => {
-      const handlers = {}
-      return (name, ...args) => {
-        const id = objectHash({
-          name,
-          args
-        })
-        if (handlers[id]) {
-          return handlers[id]
-        }
-
-        return handlers[id] = Binder(name, ...args)
+    // return new Proxy(this, handler)
+    const $this = this
+    return ApiProxy({
+      next: this.fetch.bind(this),
+      methodCallback ({ method, args = [] }) {
+        return $this[method](...args) || true
       }
+    })
+  }
+
+  /**
+   * Orchestrates returned
+   * @param endpoint
+   * @return {Promise<*>}
+   */
+  async fetch (endpoint) {
+    return this.driver({
+      url: endpoint.url,
+      method: endpoint.method,
+      params: {},
+      data: Object.assign(Object.keys(endpoint.get).length > 0 ? { $params: endpoint.get } : {}, endpoint.body || {})
+    })
+  }
+
+  savedCredentials () {
+    const credentials = {}
+    if (this._storeCredentials && process.client) {
+      Object.assign(credentials, JSON.parse(window[this._credentialsStorage].getItem(this._credentialsStorageName) || '{}'))
     }
-
-    const EntryHandler = (entityName, id) => {
-      const eventMapper = []
-
-      function eventCallback (cb, { entity: theEntity, entry }) {
-        if (entityName !== theEntity) {
-          return
-        }
-        castArray(entry).forEach((payload) => {
-          if (payload._id === id) {
-            cb(payload)
-          }
-        })
-      }
-
-      function findEventCallback (cb) {
-        let bind
-        forEach(eventMapper, ({ cb: _cb, bind: _bind }) => {
-          if (_cb === cb) {
-            bind = _bind
-            return false
-          }
-        })
-
-        if (!bind) {
-          bind = eventCallback.bind(null, cb)
-          eventMapper.push({ cb, bind })
-        }
-
-        return bind
-      }
-
-      const handler = {
-        get (obj, prop) {
-          if (/^(on|off|once|emit)$/.test(prop)) {
-            return (event, cb) => {
-              obj[prop](event, findEventCallback(cb))
-            }
-          }
-
-          if (prop in obj) {
-            return obj[prop].bind(obj, entityName, id)
-          }
-        },
-        apply () {
-          // console.log(`applying ${ entityName }`)
-        }
-      }
-
-      return new Proxy(this, handler)
-    }
-
-    const EntityHandler = (entityName) => {
-      const handler = {
-        get (obj, prop) {
-          if (prop in obj) {
-            return obj[prop].bind(obj, entityName)
-          }
-
-          if (prop === 'toJSON') {
-            return
-          }
-
-          // bind controllers
-          return obj.controller.bind(obj, entityName, kebabCase(prop))
-        }
-      }
-
-      return new Proxy(this, handler)
-    }
-
-    const EntityDelegator = DelegatorManager(EntityHandler)
-    const EntryDelegator = DelegatorManager(EntryHandler)
-
-    /*
-    Initial handler
-    this one takes all calls to pleasureClient[:entity]
-     */
-    const handler = {
-      get (obj, prop) {
-        const entityName = prop
-
-        if (typeof entityName === 'string' && !(entityName in obj)) {
-          return new Proxy(() => {}, {
-            get (obj, prop) {
-              return EntityDelegator(entityName)[prop]
-            },
-            // called when calling .entity(id) > args[0] = id
-            apply: function (target, thisArg, args) {
-              return EntryDelegator(entityName, ...args)
-            }
-          })
-        }
-
-        return obj[prop]
-      }
-    }
-
-    return new Proxy(this, handler)
+    // console.log(`credentials saved`, credentials)
+    return credentials
   }
 
   static debug (v) {
-    debug = !!v
+    return debug(v)
   }
 
   setCredentials ({ accessToken = null, refreshToken = null } = {}) {
+    if (this._storeCredentials && process.client) {
+      window[this._credentialsStorage].setItem(this._credentialsStorageName, JSON.stringify({
+        accessToken,
+        refreshToken
+      }))
+    }
     this._accessToken = accessToken
     this._refreshToken = refreshToken
 
@@ -418,14 +171,14 @@ export class ApiClient extends ReduxClient {
     const cache = await this.proxyCacheReq({ id, req })
 
     if (req.params) {
-      req.params = ApiClient.queryParamEncode(req.params)
+      req.params = queryParamEncode(req.params)
     }
 
     if (typeof cache !== 'undefined') {
       return cache
     }
 
-    debug && console.log(`@pleasure-js/api-client calling>`, { req }, `${ this.accessToken ? 'with auth' : ' without auth' }`)
+    debug() && console.log(`@pleasure-js/api-client calling>`, { req }, `${ this.accessToken ? 'with auth' : ' without auth' }`)
     const res = await this._driver(req)
 
     this
@@ -935,10 +688,10 @@ export class ApiClient extends ReduxClient {
   }
 
   static instance (opts) {
-    debug && console.log(`pleasure-client-instance`, { opts })
+    debug() && console.log(`pleasure-client-instance`, { opts })
     if (singleton) {
-      if (opts) {
-        throw new Error(`Opts not accepted since singleton instance is already initialized.`)
+      if (opts && singleton._options && objectHash(opts) !== objectHash(singleton._options)) {
+        throw new Error(`Singleton initialized.`)
       }
       return singleton
     }
@@ -970,4 +723,4 @@ export class ApiClient extends ReduxClient {
 
 const instance = ApiClient.instance.bind(ApiClient)
 
-export { getConfig, getDriver, ApiError, apiDriver, config, instance }
+export { getDriver, ApiError, instance }

@@ -1,14 +1,14 @@
 import test from 'ava'
 import { expect } from 'chai'
-import { PleasureApiClient, getConfig } from '../' // @pleasure-js/api-client
-import 'pleasure-api/test/utils/web-server.js'
+import { ApiClient, getConfig } from '../' // @pleasure-js/api-client
+import '@pleasure-js/api/test/utils/web-server.js'
 import '@pleasure-js/dev-tools/test/clean-db-per-test.js'
 import { pick } from 'lodash'
 
 let pleasureClient
 
 test.before(() => {
-  pleasureClient = PleasureApiClient.instance()
+  pleasureClient = ApiClient.instance()
   pleasureClient.on('error', error => {
     console.error(error)
   })

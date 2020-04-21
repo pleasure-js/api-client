@@ -5,17 +5,16 @@
  */
 import axios from 'axios';
 import qs from 'qs';
-import get from 'lodash/get';
+import 'lodash/get';
 import castArray from 'lodash/castArray';
-import kebabCase from 'lodash/kebabCase';
-import forEach from 'lodash/forEach';
-import mapValues from 'lodash/mapValues';
 import objectHash from 'object-hash';
 import jwtDecode from 'jwt-decode';
-import { EventEmitter } from 'events';
+import kebabCase from 'lodash/kebabCase';
 import merge from 'deepmerge';
 import io from 'socket.io-client';
 import url from 'url';
+import { EventEmitter } from 'events';
+import mapValues from 'lodash/mapValues';
 
 /**
  * Used to throw errors returned by the API server.
@@ -24,52 +23,33 @@ import url from 'url';
 class ApiError extends Error {
   /**
    *
-   * @param {String} error - Error name.
    * @param {String} message
    * @param {Number} [code=500] - Error number.
    * @param data
    */
-  constructor (error, message, code = 500, data) {
-    super(error);
-    this.message = message;
+  constructor (message, code = 500, data) {
+    super(message);
     this.code = code;
     this.data = data;
   }
 }
 
-/**
- * @typedef {Object} ApiClientConfig
- * @property {Object} api - PleasureApi related configuration.
- * @property {String} [appURL=http://localhost:3000] - URL to the APP
- * @property {String} [apiURL=http://localhost:3000/api] - URL to the API server
- * @property {String} [entitiesUri=/entities] - endpoint where to access the entities schema.
- * @property {String} [authEndpoint=/token] - endpoint where to exchange credentials for accessToken / refreshToken.
- * @property {String} [revokeEndpoint=/revoke] - endpoint where to exchange credentials for accessToken / refreshToken.
- * @property {Number} [timeout=15000] - axios timeout in ms.
- */
+let _debug = false;
 
-function getConfig () {
-  const appURL = (process.server && process.env.PLEASURE_MODE === '3-tier' ? process.env.PLEASURE_CLIENT_APP_SERVER_URL : process.env.PLEASURE_CLIENT_APP_URL) || `http://localhost:${ 3000 }`;
-  const apiURL = `${ appURL }${ "/api" }`;
-  return {
-    appURL,
-    apiURL: process.env.PLEASURE_CLIENT_API_URL || apiURL,
-    entitiesUri: process.env.PLEASURE_CLIENT_ENTITIES_URI || "/entities",
-    authEndpoint: process.env.PLEASURE_CLIENT_AUTH_ENDPOINT || "/token",
-    revokeEndpoint: process.env.PLEASURE_CLIENT_REVOKE_ENDPOINT || "/revoke",
-    timeout: 15000
+function debug (v) {
+  if (v === undefined) {
+    return _debug
   }
+  return _debug = !!v
 }
-
-let config = getConfig();
 
 /**
  * Creates an axios instance able to handle API responses
  * @param {String} apiURL - URL of the API
- * @param {Number} timeout - Timeout in milliseconds
+ * @param {Number} [timeout] - Timeout in milliseconds
  * @return {Object} - axios instance
  */
-function getDriver ({ apiURL = config.apiURL, timeout = config.timeout } = {}) {
+function getDriver ({ apiURL, timeout = 3000 }) {
   const driver = axios.create({
     timeout,
     baseURL: apiURL,
@@ -77,32 +57,33 @@ function getDriver ({ apiURL = config.apiURL, timeout = config.timeout } = {}) {
       return qs.stringify(params, { arrayFormat: 'brackets' })
     },
     headers: {
-      'X-Pleasure-Client': "1.0.0"
+      'X-Pleasure-Client': "1.0.0" 
     }
   });
 
-  driver.interceptors.response.use((response) => {
-      const { data: { statusCode, data, error, message } } = response || {};
+  driver.interceptors.request.use((req) => {
+      debug() && console.log(`api-client request`, req);
+      return req
+    }
+  );
 
-      if (statusCode === 200) {
+  driver.interceptors.response.use((response) => {
+      // console.log({ response })
+      const { data: { code = 500, data, error = { message: 'Unknown error', errors: [] } } } = response || {};
+
+      if (code === 200) {
         return data
       }
 
-      throw new ApiError(error, message, statusCode, data)
-    },
+      console.log(error.errors);
+
+      throw new ApiError(error.message, code, error.errors)
+    }/*,
     err => {
-      const { errors, error } = get(err, 'response.data', {});
-
-      if (process.env.API_ERROR) {
-        if (err && err.response) {
-          console.log(`[api:${ err.config.method }(${ err.response.status }/${ err.response.statusText }) => ${ err.config.url }] ${ JSON.stringify(err.response.data) }`);
-        } else {
-          console.log(`[api:`, err);
-        }
-      }
-
-      throw new Error(error || 'Unknown error')
-    });
+      console.log(`api error trapped`, err)
+      throw err
+    }*/
+  );
 
   return driver
 }
@@ -111,20 +92,149 @@ function getDriver ({ apiURL = config.apiURL, timeout = config.timeout } = {}) {
  * Instance of getDriver using default values.
  * @type getDriver
  */
-var driver = getDriver();
 
-Promise.each = async function (arr, fn) { // take an array and a function
-  for (const item of arr) await fn(item);
+/*
+Initial handler
+this one takes all calls to pleasureClient[:entity]
+ */
+const pathsToUrl = paths => {
+  return `/` + paths.map(path => {
+    if (typeof path === 'object') {
+      return path.value
+    }
+    return kebabCase(path)
+  }).join('/')
 };
 
-let _config = getConfig();
+const deliverState = (state, { body = {}, query = {}, method = 'get' } = {}) => {
+  const url = pathsToUrl(state.paths);
+  state.paths.length = 0;
+  return {
+    url,
+    method,
+    get: query,
+    body
+  }
+};
 
-let singleton;
+const handler = {
+  construct (target, args) {
+    // console.log(`constructor trap!`, ...args)
+    return target.create(...args)
+  },
+  get (obj, prop) {
+    if (Object.hasOwnProperty.call(obj, prop)) {
+      return obj[prop]
+    }
+    obj.paths.push(prop);
+    return obj.call(obj)
+  },
+  apply (target, thisArg, args) {
+    if (target.paths.length === 1) {
+      const method = target.paths[0];
+      target.paths.length = 0;
 
-let debug = false;
+      const res = target.methodCallback({ method, args });
+      if (res !== undefined) {
+        return res
+      }
+
+      target.paths.push(method);
+    }
+    target.get = args;
+    return target.apply(thisArg, args)
+  }
+};
+
+/**
+ * Creates a proxy that translates all called properties->method into a URL
+ * @example
+ *
+ * ```js
+ * const proxy = ApiProxy()
+ *
+ * // CREATE
+ * proxy.entities.user.create({
+ *   name: 'my name'
+ * }) // => [POST] /entities/user => { name: 'my name' }
+ *
+ * // READ
+ * proxy.entities.user('123') // => [GET] /entities/user/123 => { name: 'my name' }
+ *
+ * // UPDATE
+ * proxy.entities.user('123').update({
+ *   name: 'my name'
+ * }) // => [PATCH] /entities/user/123 => { name: 'my name' }
+ *
+ * proxy.entities.user({ created: { $gt: new Date('6/11/1983') } }).update({
+ *   name: 'my name'
+ * }) // => [PATCH] /entities/user?find={ created: { $gt: new Date('6/11/1983') } } => { name: 'my name' }
+ *
+ * proxy.entities.user.update({
+ *   name: 'my name'
+ * }) // => [PATCH] /entities/user => { name: 'my name' }
+ *
+ * // DELETE
+ * proxy.entities.user({ inactive: { $eq: true } }).delete() // => [DELETE] /entities/user?find={ inactive: { $eq: true } }
+ *
+ * // LIST
+ * proxy.user() // => [GET] /entities/user
+ * proxy.user({ inactive: { $eq: false } }) // => [GET] /entities/user?find={ inactive: { $eq: false } }
+ * ```
+ */
+
+function getCrudProxy ({ state, next, methodCallback }) {
+  const crudProxy = function (query = {}) {
+    if (typeof query !== 'object') {
+      this.paths.push({ value: query });
+      query = {};
+    }
+    return ApiProxy({
+      state: {
+        paths: this.paths,
+        get: query
+      },
+      next,
+      methodCallback
+    })
+  };
+
+  crudProxy.methodCallback = methodCallback;
+  crudProxy.valueOf = crudProxy.toString = function () {
+    return deliverState(this, { query: this.get })
+  };
+
+  crudProxy.then = function (fn) {
+    return fn(next(crudProxy.valueOf()))
+  };
+
+  crudProxy.create = function (body) {
+    return next(deliverState(this, { body, method: 'post' }))
+  };
+  crudProxy.update = function (body) {
+    return next(deliverState(this, { method: 'patch', body, query: this.get }))
+  };
+  crudProxy.delete = function () {
+    if (arguments.length > 0) {
+      throw new Error(`Method delete does not take any arguments`)
+    }
+    return next(deliverState(this, { method: 'delete', query: this.get }))
+  };
+  Object.assign(crudProxy, state);
+  return crudProxy
+}
+
+function ApiProxy ({ state = {}, next = r => r, methodCallback = r => r } = {}) {
+  state = getCrudProxy({ state, next, methodCallback });
+  if (!state.paths) {
+    state.paths = [];
+  }
+
+  return new Proxy(state, handler)
+}
 
 const defaultReduxOptions = {
-  autoConnect: !!process.client
+  autoConnect: !!true
 };
 
 class ReduxClient extends EventEmitter {
@@ -144,7 +254,7 @@ class ReduxClient extends EventEmitter {
     this._isConnecting = false;
     this._connectedAuth = null;
     this._host = `${ protocol }//${ host }`;
-    this._path = `${ pathname }-socket`;
+    this._path = pathname !== '/' ? pathname : null;
     this._socketId = null;
 
     this._socket = null;
@@ -157,18 +267,21 @@ class ReduxClient extends EventEmitter {
       update: this._proxySocket.bind(this, 'update'),
       delete: this._proxySocket.bind(this, 'delete'),
       '*': (event, payload) => {
-        debug && console.log(`emit all`, { event, payload });
+        debug() && console.log(`emit all`, { event, payload });
         this.emit('*', event, payload);
       }
     };
 
     if (this._options.autoConnect) {
-      this.connect();
+      process.nextTick(() => {
+        this.connect();
+      });
     }
   }
 
   connect () {
     if (this._connectedAuth === this.token && (this._isConnected || this._isConnecting)) {
+      debug() && console.log(`avoid connecting${ this._name ? ' ' + this._name : '' } due to this._connectedAuth === this.token = ${ this._connectedAuth === this.token } && this._isConnected = ${ this._isConnected } && this._isConnecting = ${ this._isConnecting })}`);
       return
     }
 
@@ -187,30 +300,30 @@ class ReduxClient extends EventEmitter {
     } : {});
 
     if (this._socket) {
-      debug && this._socketId && console.log(`disconnecting from ${ this._socketId }`);
+      debug() && this._socketId && console.log(`disconnecting from ${ this._socketId }`);
       this._unwireSocket();
       this._socket.disconnect(true);
     }
 
-    debug && console.log(`connecting ${ this.token ? 'with' : 'without' } credentials`);
+    debug() && console.log(`connecting${ this._name ? ' ' + this._name : '' } ${ this.token ? 'with' : 'without' } credentials to ${ this._host }`, { auth });
     const theSocket = io(this._host, auth);
 
-    if (debug) {
+    if (debug()) {
       theSocket.on('connect', () => {
         if (this._socket === theSocket) {
           this._socketId = theSocket.id;
-          debug && console.log(`@pleasure-js/api-client connected with id ${ theSocket.id }`);
+          debug() && console.log(`@pleasure-js/api-client${ this._name ? ' (' + this._name + ')' : '' } connected with id ${ theSocket.id }`);
         } else {
-          debug && console.log(`BEWARE! @pleasure-js/api-client connected with id ${ theSocket.id } but not the main driver`);
+          debug() && console.log(`BEWARE! @pleasure-js/api-client${ this._name ? ' (' + this._name + ')' : '' } connected with id ${ theSocket.id } but not the main driver`);
         }
       });
 
       theSocket.on('disconnect', (reason) => {
-        debug && console.log(`@pleasure-js/api-client disconnected due to ${ reason }`);
+        debug() && console.log(`@pleasure-js/api-client${ this._name ? ' (' + this._name + ')' : '' } disconnected due to ${ reason }`);
       });
 
       theSocket.on('reconnecting', (attemptNumber) => {
-        debug && console.log(`@pleasure-js/api-client reconnecting attempt # ${ attemptNumber }`);
+        debug() && console.log(`@pleasure-js/api-client${ this._name ? ' (' + this._name + ')' : '' } reconnecting attempt # ${ attemptNumber }`);
       });
     }
 
@@ -222,44 +335,12 @@ class ReduxClient extends EventEmitter {
 
   static _onEvent (event) {
     return function (packet) {
-      debug && console.log(`receiving packet ${ packet }`);
+      debug() && console.log(`receiving packet ${ packet }`);
       const args = packet.data || [];
       event.call(this, packet);
       packet.data = ['*'].concat(args);
       event.call(this, packet);
     }
-  }
-
-  /**
-   * Deeply scans and encodes complex objects to be sent via query params to the controller.
-   *
-   * - Converts regex values into { $regex, $options } for mongoDB purposes
-   *
-   * @param {Object} obj - The object to encode
-   * @return {Object} - Encoded object
-   *
-   * @example
-   *
-   * console.log(PleasureClient.queryParamEncode({ email: /@gmail.com$/i }))
-   * // { email: { $regex: '@gmail.com', $options: 'i' } }
-   */
-  static queryParamEncode (obj) {
-    return mapValues(obj, o => {
-      if (Array.isArray(o)) {
-        return o
-      }
-
-      if (o instanceof RegExp) {
-        return { $regex: o.source, $options: o.flags }
-      }
-
-      if (typeof o === 'object') {
-        return ApiClient.queryParamEncode(o)
-      }
-
-      // temporary fix for listing with double quotes
-      return JSON.stringify(o)
-    })
   }
 
   _wiring (methods, on = true, altMethod) {
@@ -278,7 +359,7 @@ class ReduxClient extends EventEmitter {
   }
 
   _proxySocket (method, payload) {
-    debug && console.log(`proxy socket`, { method, payload });
+    debug() && console.log(`proxy socket`, { method, payload });
     this.emit(method, payload);
   }
 
@@ -288,14 +369,14 @@ class ReduxClient extends EventEmitter {
   }
 
   _connect () {
-    debug && console.log(`connected ${ this._socket.id }`);
+    debug() && console.log(`connected ${ this._socket.id }`);
     this._isConnected = true;
     this._isConnecting = false;
     this.emit('connect');
   }
 
   _disconnect (err) {
-    debug && console.log(`disconnected ${ this._socket.id }`);
+    debug() && console.log(`disconnected ${ this._socket.id }`);
     this._isConnected = false;
     this.emit('disconnect');
   }
@@ -310,10 +391,61 @@ class ReduxClient extends EventEmitter {
 
   set token (v) {
     this._token = v;
-    this.connect();
+    if (this._isConnected) {
+      this.connect();
+    }
     return v
   }
 }
+
+/**
+ * Deeply scans and encodes complex objects to be sent via query params to the controller.
+ *
+ * - Converts regex values into { $regex, $options } for mongoDB purposes
+ *
+ * @param {Object} obj - The object to encode
+ * @return {Object} - Encoded object
+ *
+ * @example
+ *
+ * console.log(PleasureClient.queryParamEncode({ email: /@gmail.com$/i }))
+ * // { email: { $regex: '@gmail.com', $options: 'i' } }
+ */
+
+function queryParamEncode (obj) {
+  return mapValues(obj, o => {
+    if (Array.isArray(o)) {
+      return o
+    }
+
+    if (o instanceof RegExp) {
+      return { $regex: o.source, $options: o.flags }
+    }
+
+    if (typeof o === 'object') {
+      return queryParamEncode(o)
+    }
+
+    // temporary fix for listing with double quotes
+    return JSON.stringify(o)
+  })
+}
+
+Promise.each = async function (arr, fn) { // take an array and a function
+  for (const item of arr) await fn(item);
+};
+
+let singleton;
+
+/**
+ * @typedef {Object} ApiClientConfig
+ * @property {Object} api - PleasureApi related configuration.
+ * @property {String} [apiURL=http://localhost:3000/api] - URL to the API server
+ * @property {String} [entitiesUri=/entities] - endpoint where to access the entities schema.
+ * @property {String} [authEndpoint=/token] - endpoint where to exchange credentials for accessToken / refreshToken.
+ * @property {String} [revokeEndpoint=/revoke] - endpoint where to exchange credentials for accessToken / refreshToken.
+ * @property {Number} [timeout=15000] - axios timeout in ms.
+ */
 
 /**
  * Client for querying the API server.
@@ -341,153 +473,96 @@ class ApiClient extends ReduxClient {
    * Initializes a client driver for the API server.
    * @constructor
    *
-   * @param {Object} options - Options
+   * @param {Object} [options] - Options
+   * @param {String} [options.name] - Client name
    * @param {Object} [options.driver] - Driver to issue ajax requests to the API server. Defaults to {@link getDriver}.
-   * @param {ApiClientConfig} [options.config] - Optional object to override local configuration. See {@link ClientConfig}.
+   * @param {ApiClientConfig} options.config - Optional object to override local configuration. See {@link ClientConfig}.
    * @param {String} [options.accessToken] - Optional accessToken in case to start the driver with a session.
    * @param {String} [options.refreshToken] - Optional refreshToken in case to start the driver with a session.
    * @param {Object} [options.reduxOptions] - Redux options. See {@link ReduxClient}.
+   * @param {Boolean} [options.storeCredentials] - Whether to autoSave credentials (accessToken, refreshToken)
+   * @param {Boolean} [options.credentialsStorage='localStorage'] - Whether `localStorage` or `sessionStorage`
+   * @param {Boolean} [options.credentialsStorageName='pleasure-credentials'] - Whether to autoSave credentials (accessToken, refreshToken)
    */
-  constructor (options) {
-    const { accessToken, refreshToken, driver = getDriver(), config = _config, reduxOptions = {} } = options || {};
-    debug && console.log(`initializing @pleasure-js/api-client`, { reduxOptions });
+  constructor (options = {}) {
+    const { apiURL, timeout } = options.config;
+    const {
+      driver = getDriver({
+        apiURL,
+        timeout
+      }),
+      config,
+      reduxOptions = {},
+      storeCredentials = true,
+      credentialsStorage = 'localStorage',
+      credentialsStorageName = 'pleasure-credentials',
+      autoLoadCredentials = true
+    } = options;
+
+    debug() && console.log(`initializing @pleasure-js/api-client`, { reduxOptions });
     const { baseURL } = driver.defaults;
     super(baseURL, reduxOptions);
 
+    const { accessToken, refreshToken } = Object.assign(this.savedCredentials(), options);
+
+    this._autoLoadCredentials = autoLoadCredentials;
+    this._options = options;
+    this._name = options.name;
     this._driver = driver;
     this._userProfile = null;
     this._daemonSessionExpired = null;
     this._cache = [];
     this.config = config;
+    this._storeCredentials = storeCredentials;
+    this._credentialsStorage = credentialsStorage;
+    this._credentialsStorageName = credentialsStorageName;
 
     this.setCredentials({ accessToken, refreshToken });
 
-    /**
-     * Creates a manager for delegating magic access to entries or entities
-     *
-     * @param {Function} Binder - Function to be called
-     * @return {Function} - The binder manager
-     */
-    const DelegatorManager = (Binder) => {
-      const handlers = {};
-      return (name, ...args) => {
-        const id = objectHash({
-          name,
-          args
-        });
-        if (handlers[id]) {
-          return handlers[id]
-        }
-
-        return handlers[id] = Binder(name, ...args)
+    // return new Proxy(this, handler)
+    const $this = this;
+    return ApiProxy({
+      next: this.fetch.bind(this),
+      methodCallback ({ method, args = [] }) {
+        return $this[method](...args) || true
       }
-    };
+    })
+  }
 
-    const EntryHandler = (entityName, id) => {
-      const eventMapper = [];
+  /**
+   * Orchestrates returned
+   * @param endpoint
+   * @return {Promise<*>}
+   */
+  async fetch (endpoint) {
+    return this.driver({
+      url: endpoint.url,
+      method: endpoint.method,
+      params: {},
+      data: Object.assign(Object.keys(endpoint.get).length > 0 ? { $params: endpoint.get } : {}, endpoint.body || {})
+    })
+  }
 
-      function eventCallback (cb, { entity: theEntity, entry }) {
-        if (entityName !== theEntity) {
-          return
-        }
-        castArray(entry).forEach((payload) => {
-          if (payload._id === id) {
-            cb(payload);
-          }
-        });
-      }
-
-      function findEventCallback (cb) {
-        let bind;
-        forEach(eventMapper, ({ cb: _cb, bind: _bind }) => {
-          if (_cb === cb) {
-            bind = _bind;
-            return false
-          }
-        });
-
-        if (!bind) {
-          bind = eventCallback.bind(null, cb);
-          eventMapper.push({ cb, bind });
-        }
-
-        return bind
-      }
-
-      const handler = {
-        get (obj, prop) {
-          if (/^(on|off|once|emit)$/.test(prop)) {
-            return (event, cb) => {
-              obj[prop](event, findEventCallback(cb));
-            }
-          }
-
-          if (prop in obj) {
-            return obj[prop].bind(obj, entityName, id)
-          }
-        },
-        apply () {
-          // console.log(`applying ${ entityName }`)
-        }
-      };
-
-      return new Proxy(this, handler)
-    };
-
-    const EntityHandler = (entityName) => {
-      const handler = {
-        get (obj, prop) {
-          if (prop in obj) {
-            return obj[prop].bind(obj, entityName)
-          }
-
-          if (prop === 'toJSON') {
-            return
-          }
-
-          // bind controllers
-          return obj.controller.bind(obj, entityName, kebabCase(prop))
-        }
-      };
-
-      return new Proxy(this, handler)
-    };
-
-    const EntityDelegator = DelegatorManager(EntityHandler);
-    const EntryDelegator = DelegatorManager(EntryHandler);
-
-    /*
-    Initial handler
-    this one takes all calls to pleasureClient[:entity]
-     */
-    const handler = {
-      get (obj, prop) {
-        const entityName = prop;
-
-        if (typeof entityName === 'string' && !(entityName in obj)) {
-          return new Proxy(() => {}, {
-            get (obj, prop) {
-              return EntityDelegator(entityName)[prop]
-            },
-            // called when calling .entity(id) > args[0] = id
-            apply: function (target, thisArg, args) {
-              return EntryDelegator(entityName, ...args)
-            }
-          })
-        }
-
-        return obj[prop]
-      }
-    };
-
-    return new Proxy(this, handler)
+  savedCredentials () {
+    const credentials = {};
+    if (this._storeCredentials && true) {
+      Object.assign(credentials, JSON.parse(window[this._credentialsStorage].getItem(this._credentialsStorageName) || '{}'));
+    }
+    // console.log(`credentials saved`, credentials)
+    return credentials
   }
 
   static debug (v) {
-    debug = !!v;
+    return debug(v)
   }
 
   setCredentials ({ accessToken = null, refreshToken = null } = {}) {
+    if (this._storeCredentials && true) {
+      window[this._credentialsStorage].setItem(this._credentialsStorageName, JSON.stringify({
+        accessToken,
+        refreshToken
+      }));
+    }
     this._accessToken = accessToken;
     this._refreshToken = refreshToken;
 
@@ -519,14 +594,14 @@ class ApiClient extends ReduxClient {
     const cache = await this.proxyCacheReq({ id, req });
 
     if (req.params) {
-      req.params = ApiClient.queryParamEncode(req.params);
+      req.params = queryParamEncode(req.params);
     }
 
     if (typeof cache !== 'undefined') {
       return cache
     }
 
-    debug && console.log(`@pleasure-js/api-client calling>`, { req }, `${ this.accessToken ? 'with auth' : ' without auth' }`);
+    debug() && console.log(`@pleasure-js/api-client calling>`, { req }, `${ this.accessToken ? 'with auth' : ' without auth' }`);
     const res = await this._driver(req);
 
     this
@@ -1036,10 +1111,10 @@ class ApiClient extends ReduxClient {
   }
 
   static instance (opts) {
-    debug && console.log(`pleasure-client-instance`, { opts });
+    debug() && console.log(`pleasure-client-instance`, { opts });
     if (singleton) {
-      if (opts) {
-        throw new Error(`Opts not accepted since singleton instance is already initialized.`)
+      if (opts && singleton._options && objectHash(opts) !== objectHash(singleton._options)) {
+        throw new Error(`Singleton initialized.`)
       }
       return singleton
     }
@@ -1071,4 +1146,4 @@ class ApiClient extends ReduxClient {
 
 const instance = ApiClient.instance.bind(ApiClient);
 
-export { ApiClient, ApiError, driver as apiDriver, config, debug, defaultReduxOptions, getConfig, getDriver, instance };
+export { ApiClient, ApiError, getDriver, instance };
